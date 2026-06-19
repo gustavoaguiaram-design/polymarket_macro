@@ -36,55 +36,80 @@ class MarketMonitor:
 
     # ── BTC em tempo real ─────────────────────────────────────────────────────
 
+    # APIs de preço BTC (tenta em ordem até funcionar)
+    BTC_APIS = [
+        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true",
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+        "https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD",
+    ]
+
     async def _btc_loop(self):
         while self.running:
             try:
-                # Preço atual
-                async with self._session.get(
-                    f"{BINANCE_API}/fapi/v1/ticker/price",
-                    params={"symbol": "BTCUSDT"},
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        self.btc_current = float(data["price"])
-
-                # Candles 1h para calcular movimento
-                async with self._session.get(
-                    f"{BINANCE_API}/fapi/v1/klines",
-                    params={"symbol": "BTCUSDT", "interval": "1m", "limit": 60},
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as r:
-                    if r.status == 200:
-                        candles = await r.json()
-                        closes = [float(c[4]) for c in candles]
-                        self.btc_prices = closes
-
-                        if len(closes) >= 60:
-                            self.btc_1h_move = (closes[-1] - closes[0]) / closes[0] * 100
-
-                        # 24h move
-                        async with self._session.get(
-                            f"{BINANCE_API}/fapi/v1/ticker/24hr",
-                            params={"symbol": "BTCUSDT"},
-                            timeout=aiohttp.ClientTimeout(total=5)
-                        ) as r24:
-                            if r24.status == 200:
-                                d24 = await r24.json()
-                                self.btc_24h_move = float(d24.get("priceChangePercent", 0))
-
-                        # Detecta movimento brusco
-                        if abs(self.btc_1h_move) >= BTC_MOVE_TRIGGER:
-                            self._add_alert("BTC_MOVE", {
-                                "move_pct": round(self.btc_1h_move, 3),
-                                "price": self.btc_current,
-                                "direction": "UP" if self.btc_1h_move > 0 else "DOWN"
-                            })
-
+                await self._fetch_btc_price()
             except Exception as e:
                 print(f"[Monitor] Erro BTC: {e}")
-
             await asyncio.sleep(10)
+
+    async def _fetch_btc_price(self):
+        """Tenta múltiplas APIs públicas para pegar preço do BTC"""
+        for api_url in self.BTC_APIS:
+            try:
+                async with self._session.get(
+                    api_url, timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.json()
+
+                    # CoinGecko
+                    if "bitcoin" in data:
+                        price = float(data["bitcoin"]["usd"])
+                        change_24h = float(data["bitcoin"].get("usd_24h_change", 0))
+                        self._update_btc(price, change_24h)
+                        return
+
+                    # Coinbase
+                    if "data" in data and "amount" in data.get("data", {}):
+                        price = float(data["data"]["amount"])
+                        self._update_btc(price, 0)
+                        return
+
+                    # CryptoCompare
+                    if "USD" in data:
+                        price = float(data["USD"])
+                        self._update_btc(price, 0)
+                        return
+
+            except Exception as e:
+                continue
+
+        print("[Monitor] Todas as APIs de BTC falharam")
+
+    def _update_btc(self, price: float, change_24h: float):
+        """Atualiza preço e calcula movimento"""
+        prev = self.btc_current
+        self.btc_current = price
+        self.btc_24h_move = round(change_24h, 3)
+
+        # Histórico de preços
+        self.btc_prices.append(price)
+        if len(self.btc_prices) > 60:
+            self.btc_prices = self.btc_prices[-60:]
+
+        # Movimento 1h
+        if len(self.btc_prices) >= 6:
+            self.btc_1h_move = round(
+                (self.btc_prices[-1] - self.btc_prices[0]) / self.btc_prices[0] * 100, 3
+            )
+
+        # Alerta de movimento brusco
+        if abs(self.btc_1h_move) >= BTC_MOVE_TRIGGER:
+            self._add_alert("BTC_MOVE", {
+                "move_pct": self.btc_1h_move,
+                "price": price,
+                "direction": "UP" if self.btc_1h_move > 0 else "DOWN"
+            })
 
     # ── Notícias via Claude ───────────────────────────────────────────────────
 
